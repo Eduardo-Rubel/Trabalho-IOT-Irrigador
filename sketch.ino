@@ -31,6 +31,13 @@
 
 #define BLYNK_PRINT Serial   // mostra os logs do Blynk no monitor serial
 
+// ---------------------------------------------------------------------
+// R2 - DECISÃO LOCAL: para demonstrar o sistema SEM INTERNET, troque
+// para true. O ESP32 não conecta no Wi-Fi nem no Blynk e continua
+// irrigando sozinho com base no potenciômetro (sensor de umidade).
+// ---------------------------------------------------------------------
+#define MODO_SEM_INTERNET false
+
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <BlynkSimpleEsp32.h>
@@ -83,7 +90,11 @@ const int TOLERANCIA_POT = 3;
 // ---------------------------------------------------------------------
 BlynkTimer timer;
 
-const bool usarBlynk = (strcmp(BLYNK_AUTH_TOKEN, "SEU_TOKEN_AQUI") != 0);
+const bool usarBlynk = !MODO_SEM_INTERNET &&
+                       (strcmp(BLYNK_AUTH_TOKEN, "SEU_TOKEN_AQUI") != 0);
+
+const unsigned long INTERVALO_RECONEXAO_MS = 10000UL;  // tenta o Blynk a cada 10 s
+unsigned long ultimaTentativaBlynk = 0;
 
 int  umidade        = 0;
 bool bombaLigada    = false;
@@ -145,6 +156,10 @@ void controle() {
     umidadeSlider = -1;   // mexeram no potenciômetro: ele volta a mandar
     Serial.println(">>> Fonte da umidade: potenciometro");
   }
+  if (umidadeSlider >= 0 && !blynkOnline()) {
+    umidadeSlider = -1;   // sem internet o slider não vale: volta o sensor local
+    Serial.println(">>> Sem conexao: umidade volta a vir do potenciometro");
+  }
   ultimoPot = pot;
   umidade = (umidadeSlider >= 0) ? umidadeSlider : pot;
 
@@ -154,7 +169,12 @@ void controle() {
     ultimoEnviadoSlider = umidade;
   }
 
-  // Controle automático com histerese (evita liga/desliga sem parar)
+  // =================================================================
+  // R2 - DECISÃO LOCAL (roda no próprio ESP32, não depende da internet)
+  //   SE umidade < 30%            -> liga a bomba
+  //   SE umidade >= 60%           -> desliga a bomba
+  //   entre 30% e 60%             -> mantém como está (histerese)
+  // =================================================================
   if (!irrigandoAuto && umidade < LIMITE_SECO) {
     irrigandoAuto = true;
   } else if (irrigandoAuto && umidade >= LIMITE_IDEAL) {
@@ -190,7 +210,7 @@ void controle() {
                 bombaLigada ? "ON" : "OFF",
                 manualAtivo ? "manual" : "automatico",
                 status.c_str(),
-                blynkOnline() ? "online" : (usarBlynk ? "conectando" : "offline"));
+                blynkOnline() ? "online" : "OFFLINE (decisao local)");
 }
 
 // ---------------------------------------------------------------------
@@ -251,19 +271,18 @@ void setup() {
   digitalWrite(PINO_RELE, LOW);
   analogReadResolution(12);
 
-  Serial.print("Conectando ao Wi-Fi ");
-  WiFi.begin(WIFI_SSID, WIFI_PASS, WIFI_CANAL);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " FALHOU (seguindo offline)");
-
   if (usarBlynk) {
-    Blynk.config(BLYNK_AUTH_TOKEN);   // a conexão acontece dentro do Blynk.run()
+    Serial.print("Conectando ao Wi-Fi ");
+    WiFi.begin(WIFI_SSID, WIFI_PASS, WIFI_CANAL);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+      delay(250);
+      Serial.print(".");
+    }
+    Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " FALHOU (seguindo offline)");
+    Blynk.config(BLYNK_AUTH_TOKEN);   // a conexão é feita no loop()
   } else {
-    Serial.println("Token do Blynk nao configurado: rodando em modo OFFLINE.");
+    Serial.println("Modo SEM INTERNET: so a decisao local esta ativa.");
   }
 
   timer.setInterval(INTERVALO_LEITURA_MS, controle);
@@ -271,10 +290,18 @@ void setup() {
 }
 
 void loop() {
-  // O controle automático roda sempre, mesmo sem internet
+  // R2: a decisão local roda SEMPRE, com ou sem internet
   timer.run();
 
-  if (usarBlynk && WiFi.status() == WL_CONNECTED) {
+  if (!usarBlynk) return;
+
+  if (Blynk.connected()) {
     Blynk.run();
+  } else if (WiFi.status() == WL_CONNECTED &&
+             millis() - ultimaTentativaBlynk >= INTERVALO_RECONEXAO_MS) {
+    // Tentativa curta (2 s) para não travar a irrigação se a internet cair
+    ultimaTentativaBlynk = millis();
+    Serial.println("Tentando conectar ao Blynk...");
+    Blynk.connect(2000);
   }
 }
